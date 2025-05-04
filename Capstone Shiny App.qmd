@@ -1,0 +1,12 @@
+---
+title: "Capstone Shiny App"
+format: pdf
+editor: visual
+---
+
+## Libraries
+
+```{r}
+install.packages("shiny")
+library(shiny)
+```
