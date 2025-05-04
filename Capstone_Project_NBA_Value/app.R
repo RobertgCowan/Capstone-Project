@@ -1,5 +1,5 @@
 #data
-read.csv("/Users/home/Desktop/Capstone Git/current_player_preds.csv")
+current_players_preds <- read.csv("current_player_preds.csv")
 
 library(shiny)
 library(ggplot2)
