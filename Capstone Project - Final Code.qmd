@@ -418,28 +418,4 @@ ggplot(TEAM, aes(x = reorder(Player, True.Salary))) +
   ) +
   theme_minimal(base_family = "Verdana") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-
-```
-
-```{r}
-numeric_signings <- current_players_preds %>%
-  dplyr::select(True.Salary, Pred.Salary, True.Length, Estimate.LengthYears, Estimate.SalaryCapp)
-
-matrix_signings <- cor(numeric_signings, use = "pairwise.complete.obs")
-
-corrplot(matrix_signings, type="upper", 
-         order="hclust", 
-         method = "number",
-         number.cex = 0.8,
-         col=brewer.pal(n=8, name="BuGn"), 
-         tl.col="black", 
-         tl.srt=45)
-```
-
-```{r}
-nrow(player_signing_data)
-nrow(player_signing_data) / 6
-801-133
-134/668
 ```
