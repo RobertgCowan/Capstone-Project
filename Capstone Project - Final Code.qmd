@@ -1,0 +1,445 @@
+---
+title: "Capstone Project"
+format: pdf
+editor: visual
+---
+
+# Projecting NBA Contracts
+
+## [Package/Library Entry]{.underline}
+
+```{r, warning = FALSE}
+#| echo: false
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(MASS)
+library(glmnet)
+library(ROCR)
+library(xgboost)
+library(Metrics)
+library(carat)
+library(corrplot)
+library(stringi)
+library(RColorBrewer)
+library(lubridate)
+library(brms)
+library(BayesSUR)
+library(caret) 
+library(tidyverse)
+library(scales)
+```
+
+```{r}
+player_signing_data <- read.csv("/Users/home/Desktop/Suns Application Project/player_signing_data.csv")
+```
+
+## [Analysis]{.underline}
+
+### Variable Selection
+
+#### Correlation Matrix
+
+```{r}
+numeric_signings <- player_signing_data %>%
+  dplyr::select(where(is.numeric))
+
+matrix_signings <- cor(numeric_signings, use = "pairwise.complete.obs")
+
+corrplot(matrix_signings, type="upper", 
+         order="hclust", 
+         method = "color",
+         col=brewer.pal(n=8, name="PuOr"), 
+         tl.col="black", 
+         tl.srt=45)
+```
+
+```{r}
+numeric_signings <- player_signing_data %>%
+  dplyr::select(PTS, FG, VORPg, FTM, TOV, WSg, MPG, Start.Rate, USGp, DBPM, Age)
+
+matrix_signings <- cor(numeric_signings, use = "pairwise.complete.obs")
+
+corrplot(matrix_signings, type="upper", 
+         order="hclust", 
+         method = "number",
+         number.cex = 0.8,
+         col=brewer.pal(n=8, name="BuGn"), 
+         tl.col="black", 
+         tl.srt=45)
+```
+
+```{r}
+#Because we are going to be using a multivariate model, we will look at which statistics correlate to both the Salary Cap Percentage and Length of the Contract
+cor_matrix <- cor(player_signing_data %>% 
+                    select_if(is.numeric) %>% 
+                    dplyr::select(-AAV, -Value), 
+                  use = "complete.obs")
+
+#Salary Cap Percentage
+cor_with_salary <- cor_matrix["Salary.Cap.p",]
+
+# Sort the correlations by absolute value
+sorted_cor_salary <- sort(cor_with_salary, decreasing = TRUE)
+
+# Display the sorted correlations as DF
+cor_table_salary <- data.frame(Correlation = sorted_cor_salary)
+
+#Length of Contract
+cor_with_length <- cor_matrix["Length.Years",]
+
+sorted_cor_length <- sort(cor_with_length, decreasing = TRUE)
+
+cor_table_length <- data.frame(Correlation = sorted_cor_length)
+
+print(cor_table_salary)
+print(cor_table_length)
+```
+
+Before moving forward with the model, it is important to note that this is a **positionless** model. This means that certain variables, such as 3P%, could skew the model towards certain archetypes or positions, and reduce the usefulness of the model. This is also why we don't use player measureables such as height or weight. Because of this limitation, the variable selection will use more advanced player statistics such as VORP, PER, or WS.
+
+```{r}
+length_salary_dist <- player_signing_data %>%
+  group_by(Length.Years) %>%
+  summarise(
+    Min = min(Salary.Cap.p, na.rm = TRUE),
+    Q1 = quantile(Salary.Cap.p, 0.25, na.rm = TRUE),
+    Median = median(Salary.Cap.p, na.rm = TRUE),
+    Q3 = quantile(Salary.Cap.p, 0.75, na.rm = TRUE),
+    Max = max(Salary.Cap.p, na.rm = TRUE)
+  ) %>%
+  arrange(Length.Years)
+length_salary_dist
+```
+
+## [Model]{.underline}
+
+```{r}
+cross_prior <-  c(
+  prior(normal(0, 10), class = "b", resp = "SalaryCapp"),
+  
+  prior(normal(8.4, 9.4), class = "Intercept", resp = "SalaryCapp", lb = 0, ub = 45),
+  
+  prior(normal(0, 1.5), class = "b", resp = "LengthYears"),
+  
+  prior(normal(2.3, 1.2), class = "Intercept", resp = "LengthYears")
+) 
+
+folds <- createFolds(player_signing_data$Salary.Cap.p, k = 6, list = TRUE)
+
+results <- list()
+
+for (i in 1:6) {
+  print(i)
+  
+  # Split data 
+  test_indices <- folds[[i]]
+  train_data <- player_signing_data[-test_indices, ]
+  test_data <- player_signing_data[test_indices, ]
+  
+  # Fit model
+  fit <- brm(
+  bf(Salary.Cap.p ~ PTS + FG + VORPg + FTM + TOV + WSg + MPG + Start.Rate + USGp + DBPM, 
+     family = gaussian()) +  
+  bf(Length.Years ~ Age + FG + PTS + MPG + WSg + VORPg + Start.Rate, 
+     family = poisson()),  
+  data = train_data,
+  prior = cross_prior,
+  chains = 4, iter = 2000, cores = 4
+)
+
+  # Make predictions on test set
+  predictions <- predict(fit, newdata = test_data)
+
+  # Calculate the R-squared for Salary.Cap.p
+  r2_salary <- 1 - sum((predictions[, "Estimate", "SalaryCapp"] - test_data$Salary.Cap.p)^2) / sum((test_data$Salary.Cap.p - mean(test_data$Salary.Cap.p))^2)
+  
+  r2_length <- 1 - sum((predictions[, "Estimate", "LengthYears"] - test_data$Length.Years)^2) / sum((test_data$Length.Years - mean(test_data$Length.Years))^2)
+  
+  rmse_salary <- rmse(actual = test_data$Salary.Cap.p, 
+                      predicted = predictions[, "Estimate", "SalaryCapp"])
+
+  rmse_length <- rmse(actual = test_data$Length.Years, 
+                      predicted = predictions[, "Estimate", "LengthYears"])
+  
+  results[[i]] <- c(round(r2_salary, 4), round(rmse_salary, 4), 
+                    round(r2_length, 4), round(rmse_length, 4))
+  
+  print(paste0("Through ", i, ":"))
+  accuracy <- colMeans(do.call(rbind, results))
+  print(accuracy)
+}
+```
+
+### **Outcomes:**
+
+Poisson With Precise Priors
+
+*Salary: R2 0.795, RMSE 4.35*
+
+*Length: R2 0.50, RMSE 0.88*
+
+```{r}
+preds <- predict(fit, player_signing_data, summary = FALSE)
+```
+
+```{r}
+salary_mean <- apply(preds[, , "SalaryCapp"], 2, mean)
+length_mean <- apply(preds[, , "LengthYears"], 2, mean)
+
+results <- data.frame(
+  true_salary = player_signing_data$Salary.Cap.p,
+  true_length = player_signing_data$Length.Years, 
+  preds_salary = salary_mean,  
+  preds_length = length_mean
+)
+
+results <- results %>%
+  mutate(preds_salary = ifelse(preds_salary < 0, 0, preds_salary))
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+rmse_salary <- rmse(results$true_salary, results$preds_salary)
+rmse_length <- rmse(results$true_length, results$preds_length)
+
+rsq <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+
+r2_salary <- rsq(results$true_salary, results$preds_salary)
+r2_length <- rsq(results$true_length, results$preds_length)
+
+cat("Salary R²:", round(r2_salary, 4), "\n")
+cat("Salary RMSE:", round(rmse_salary, 4), "\n")
+
+cat("Length R²:", round(r2_length, 4), "\n")
+cat("Length RMSE:", round(rmse_length, 4), "\n")
+```
+
+```{r}
+plot_data <- data.frame(
+  True = results$true_salary,
+  Predicted = results$preds_salary
+)
+
+ggplot(plot_data, aes(x = True, y = Predicted)) +
+  geom_point(alpha = 0.7, color = "black") +  # Adds scatter plot points
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +  
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Predicted vs True Salary Cap %",
+    subtitle = "Red Line = Target Values; Blue Line = Line of Best Fit", 
+    x = "True Salary Cap %",
+    y = "Predicted Salary Cap %"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+results %>%
+  mutate(Player = player_signing_data$Player, 
+         Age = player_signing_data$Age,
+         G = player_signing_data$G, 
+         net.salary = preds_salary - true_salary) %>%
+  filter(true_salary < 5) %>%
+  dplyr::select(Player, Age, G, net.salary) %>%
+  arrange(desc(net.salary))
+```
+
+```{r}
+plot_data <- data.frame(
+  True = results$true_length,
+  Predicted = results$preds_length
+)
+
+ggplot(plot_data, aes(x = factor(True), y = Predicted)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_boxplot(alpha = 0.6) +  # Adds scatter plot points
+  labs(
+    title = "Predicted vs True Length - Years",
+    x = "True Length - Years",
+    y = "Predicted Length - Years"
+  ) +
+  theme_minimal()
+```
+
+==================================================================
+
+## [Projections:]{.underline}
+
+#### Data Entry & Cleaning:
+
+Entry:
+
+```{r}
+free_agent_signings <- read.csv("/Users/home/Desktop/Suns Application Project/free_agent_signings.csv")
+
+current_player_signings <- read.csv("/Users/home/Desktop/Suns Application Project/current_player_signings.csv")
+```
+
+### [Free Agency:]{.underline}
+
+Isolate 2025 free agency class for projection:
+
+Predict free agents
+
+```{r}
+free_agency_preds <- as.data.frame(predict(fit, newdata = free_agent_signings)) %>%
+  mutate(Player = free_agent_signings$Player) %>%
+  mutate(Salary = 154647000 * Estimate.SalaryCapp / 100) %>%
+  dplyr::select(Player, Salary, Estimate.SalaryCapp, Estimate.LengthYears) %>%
+  mutate(Salary = paste0(round(Salary / 1e6, 2), "M")) %>%
+  mutate(Estimate.SalaryCapp = round(Estimate.SalaryCapp, 2)) %>%
+  mutate(Estimate.LengthYears = round(Estimate.LengthYears, 2)) %>%
+  arrange(desc(Estimate.SalaryCapp))
+
+free_agency_preds
+```
+
+### [Current Team Net Cap:]{.underline}
+
+```{r}
+current_players_preds <- as.data.frame(predict(fit, newdata = current_player_signings)) %>%
+  #Take necessary data from current_player_signings
+  mutate(Player = current_player_signings$Player, 
+         True.Salary = current_player_signings$AAV, 
+         True.Length = current_player_signings$Length.Years, 
+         Team = current_player_signings$Team) %>%
+  #Add predicted AAV based on current cap
+  mutate(Pred.Salary = ifelse(Estimate.SalaryCapp > 0, 
+                              140588000 * Estimate.SalaryCapp / 100, 0), 
+         Net.Salary = Pred.Salary - True.Salary) %>%
+  dplyr::select(Player, Team, True.Salary, Pred.Salary, Net.Salary, 
+                Estimate.SalaryCapp, True.Length, Estimate.LengthYears) %>%
+  mutate(Estimate.SalaryCapp = round(Estimate.SalaryCapp, 2)) %>%
+  mutate(Estimate.LengthYears = round(Estimate.LengthYears, 2)) %>%
+  arrange(desc(Estimate.SalaryCapp))
+```
+
+```{r}
+teams <- current_players_preds %>%
+  group_by(Team) %>%
+  summarise(Team.Net.Salary = paste0(round(sum(Net.Salary) / 1e6, 1), "M"),
+            Team.Net.Quant = sum(Net.Salary)) %>%
+  arrange(desc(Team.Net.Quant))
+
+teams
+ggplot(teams, aes(x = reorder(Team, Team.Net.Quant), y = Team.Net.Quant)) +
+  geom_col() +
+  geom_hline(yintercept = 0, color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+TEAM <- current_players_preds %>%
+  filter(Team == "PHO") %>%
+  arrange(True.Salary) %>%
+  mutate(Player = factor(Player, levels = Player), 
+         line_color = case_when(
+           abs(True.Salary - Pred.Salary) <= 1e6 ~ "gold2",
+           True.Salary > Pred.Salary ~ "red",
+           True.Salary < Pred.Salary ~ "green4"
+         ), 
+         up_down = as.factor(case_when(
+           abs(True.Salary - Pred.Salary) <= 1e6 ~ 23,  # Square
+           True.Salary > Pred.Salary ~ 25,  # Downward arrow
+           True.Salary < Pred.Salary ~ 24   # Upward arrow
+         )))  
+
+ggplot(TEAM, aes(x = Player)) +
+  # Add vertical lines
+  geom_segment(aes(x = Player, xend = Player, y = True.Salary, yend = Pred.Salary, color = line_color), linewidth = 1) +
+  # Add points for True and Predicted Salaries
+  geom_point(aes(y = True.Salary, color = "black"), size = 2.5) +
+  geom_point(aes(y = Pred.Salary, fill = line_color, shape = up_down), 
+             color = TEAM$line_color, size = 2) +
+  # Labels and theme
+  labs(title = paste0("True vs. Estimated Player Values for ", as.character(TEAM$Team[1])),
+       subtitle = "Black = Contract Value; Arrow = Performance Value; Yellow = Values Within 500K",
+       x = "Player",
+       y = "Salary") +
+  scale_y_continuous(labels = label_number(scale = 1e-6, suffix = "M")) +
+  scale_color_identity() +
+  scale_fill_identity() +
+  scale_shape_manual(values = c("25" = 25, "24" = 24, "23" = 23)) +
+  guides(shape = "none") +
+  theme_minimal(base_family = "Verdana") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+current_players_preds <- current_players_preds %>%
+  mutate(Performance.Multiplier = Pred.Salary/True.Salary) %>%
+  arrange(desc(Performance.Multiplier))
+```
+
+```{r}
+TEAM <- current_players_preds %>%
+  filter(Team == "LAL")
+
+ggplot(TEAM, aes(x = reorder(Player, True.Salary))) +
+  # Bars go up/down relative to 1
+  geom_col(aes(y = Performance.Multiplier - 1), color = "darkgrey", fill = "lightgrey") +
+
+  # Dashed line at zero (represents multiplier = 1)
+  geom_hline(yintercept = 0, color = "grey4") +
+
+  # Text labels at actual multiplier value
+  geom_text(aes(
+    y = Performance.Multiplier - 1,
+    label = paste0(round(Performance.Multiplier, 2), "x"),
+    vjust = ifelse(Performance.Multiplier >= 1, -0.5, 1.5)
+  ),
+  size = 3,
+  fontface = "italic",
+  family = "Verdana") +
+
+  # Adjust y-axis so 0 means 1x, and display ticks accordingly
+  scale_y_continuous(
+    breaks = seq(
+      floor(min(TEAM$Performance.Multiplier - 1)),
+      ceiling(max(TEAM$Performance.Multiplier - 1)), 
+      by = 1
+    ),
+    labels = function(x) paste0(x + 1, "x")
+  ) +
+
+  # Labels and theme
+  labs(
+    title = paste0("Player Performance Multipliers for ", as.character(TEAM$Team[1])),
+    subtitle = "A player's performance value as a multiplier of their true salary",
+    x = "Player",
+    y = "Multiplier"
+  ) +
+  theme_minimal(base_family = "Verdana") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+numeric_signings <- current_players_preds %>%
+  dplyr::select(True.Salary, Pred.Salary, True.Length, Estimate.LengthYears, Estimate.SalaryCapp)
+
+matrix_signings <- cor(numeric_signings, use = "pairwise.complete.obs")
+
+corrplot(matrix_signings, type="upper", 
+         order="hclust", 
+         method = "number",
+         number.cex = 0.8,
+         col=brewer.pal(n=8, name="BuGn"), 
+         tl.col="black", 
+         tl.srt=45)
+```
+
+```{r}
+nrow(player_signing_data)
+nrow(player_signing_data) / 6
+801-133
+134/668
+```
